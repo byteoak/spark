@@ -96,6 +96,19 @@ private[sql] object UdfToProtoUtils {
           .setPayload(toUdfPacketBytes(f.f, inputEncoders, outputEncoder))
           .setOutputType(toConnectProtoType(outputEncoder.dataType))
           .setAggregate(false)
+        // SPIKE (SPARK-51705 Scala follow-up): drain the ids of any ConnectBroadcast captured by
+        // this closure into ScalarScalaUDF.broadcast_ids (proto field 6). This mirrors the Python
+        // side, where PythonUDF.to_plan drains a threading.local registry into
+        // `python_udf.broadcast_ids` right after CloudPickleSerializer().dumps(...).
+        //
+        // Mechanics for Scala (NOT implemented here -- illustrative):
+        //   - spark.broadcast(v) side-registers the new ConnectBroadcast id into a ThreadLocal.
+        //   - toUdfPacketBytes above serializes the closure; ConnectBroadcast.writeReplace fires
+        //     for each captured broadcast, so the set of captured ids == what was written.
+        //   - Drain that ThreadLocal here (drain-then-clear, same discipline as Python) and:
+        //       ConnectBroadcastCapture.drain().foreach(protoUdf.addBroadcastIds)
+        // The drain MUST happen after toUdfPacketBytes (serialization is what triggers
+        // writeReplace), and MUST be scoped per plan-build thread. See SCALA-SPIKE-FINDINGS.md.
         f.givenName.foreach(invokeUdf.setFunctionName)
       case f: UserDefinedAggregator[_, _, _] =>
         val outputEncoder = agnosticEncoderFor(f.aggregator.outputEncoder)

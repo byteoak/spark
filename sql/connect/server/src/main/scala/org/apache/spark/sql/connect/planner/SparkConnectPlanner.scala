@@ -2095,7 +2095,45 @@ class SparkConnectPlanner(
   }
 
   private def unpackUdf(fun: proto.CommonInlineUserDefinedFunction): UdfPacket = {
-    unpackScalaUDF[UdfPacket](fun.getScalarScalaUdf)
+    // SPIKE (SPARK-51705 Scala follow-up): if this Scala UDF references broadcast variables created
+    // over Connect, bind the per-session registry into a thread-local so that
+    // ConnectBroadcastRef.readResolve (fired DURING the JVM deserialization inside unpackScalaUDF)
+    // can swap each id-only wire token for the real driver-side Broadcast[_]. This is the
+    // server half of Candidate A (writeReplace/readResolve). See SCALA-SPIKE-FINDINGS.md.
+    //
+    // Contrast with Python: transformPythonFunction just sets `broadcastVars = resolveBroadcasts(..)`
+    // as an explicit list the PythonRunner injects into the worker -- the closure (pickled command
+    // bytes) is NEVER deserialized on the JVM, so no readResolve dance is needed there. For Scala
+    // the Broadcast lives INSIDE the serialized closure object graph, so we must intercept
+    // deserialization itself. This is the crux and the reason Scala is materially harder.
+    val scalaUdf = fun.getScalarScalaUdf
+    val broadcastIds = scalaUdf.getBroadcastIdsList
+    if (broadcastIds.isEmpty) {
+      unpackScalaUDF[UdfPacket](scalaUdf)
+    } else {
+      // SPIKE / DEPENDENCY: this branch is off master; the SessionHolder broadcast registry
+      // (sessionHolder.getBroadcast), the `import org.apache.spark.broadcast.Broadcast`, and
+      // InvalidInputErrors.broadcastNotFound are all introduced by the Python v1 PR
+      // (branch `broadcast-connect-python-v1`). The Scala follow-up STACKS ON that PR and reuses
+      // the same per-session registry + BROADCAST_NOT_FOUND error verbatim. It does NOT compile
+      // against bare master. See SCALA-SPIKE-FINDINGS.md ("What a real Scala impl requires").
+      //
+      // Eagerly validate + build the id -> Broadcast[_] map (fail loud on unknown/foreign ids,
+      // mirroring resolveBroadcasts for Python -> BROADCAST_NOT_FOUND, not a silent broken proxy).
+      val registry: Map[Long, org.apache.spark.broadcast.Broadcast[_]] =
+        broadcastIds.asScala.map { boxedId =>
+          val id = boxedId.longValue()
+          val bcast = sessionHolder
+            .getBroadcast(id) // SPIKE: from python-v1 SessionHolder registry
+            .getOrElse(throw InvalidInputErrors.broadcastNotFound(id)) // SPIKE: from python-v1
+          id -> bcast.asInstanceOf[org.apache.spark.broadcast.Broadcast[_]]
+        }.toMap
+      // SPIKE: ConnectBroadcastResolver + ConnectBroadcastRef live in sql/connect/common so both
+      // client (writeReplace) and server (readResolve) share the identical token class.
+      org.apache.spark.sql.connect.ConnectBroadcastResolver.withRegistry(registry) {
+        unpackScalaUDF[UdfPacket](scalaUdf)
+      }
+    }
   }
 
   private def unpackForeachWriter(fun: proto.ScalarScalaUDF): ForeachWriterPacket = {

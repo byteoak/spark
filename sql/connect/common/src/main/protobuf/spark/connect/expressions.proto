@@ -488,6 +488,15 @@ message ScalarScalaUDF {
   bool nullable = 4;
   // (Required) Indicate if the UDF is an aggregate function
   bool aggregate = 5;
+  // SPIKE (SPARK-51705 Scala follow-up): server-assigned ids of broadcast variables referenced by
+  // this UDF closure. Mirrors PythonUDF.broadcast_ids (field 6 there too). Field 6 is next-free on
+  // ScalarScalaUDF as well. Unlike Python, this list is NOT sufficient on its own: for a Scala
+  // closure the Broadcast[T] lives *inside* the serialized `payload` object graph as a field, so
+  // this list is only an out-of-band hint (used to eagerly validate ids and to bind the
+  // SessionHolder registry into the deserialization thread-local). The actual object-graph
+  // rehydration happens via ConnectBroadcast.writeReplace/readResolve during payload deserialize.
+  // See SCALA-SPIKE-FINDINGS.md. NOTE: proto stubs are NOT regenerated for this spike.
+  repeated int64 broadcast_ids = 6;
 }
 
 message JavaUDF {
